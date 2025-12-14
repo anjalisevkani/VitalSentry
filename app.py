@@ -1,81 +1,137 @@
 import cv2
 import numpy as np
-from src.camera import get_camera
-from src.face_mesh import face_mesh
-from src.roi_extractor import extract_roi
-from src.signal_processing import bandpass
-from src.heart_rate import calculate_bpm, calculate_respiration
+import mediapipe as mp
+from scipy.signal import butter, filtfilt, find_peaks
+from scipy.fftpack import fft
+import time
 
-# -------------------------------
-# Configuration
-# -------------------------------
-FOREHEAD = [10, 338, 297]  # Landmarks for forehead ROI
-fs = 30  # Camera frames per second
-cap = get_camera()
+# ===============================
+# CONFIGURATION
+# ===============================
+fs = 30  # Camera FPS
+WINDOW_SECONDS = 8
+WINDOW_SIZE = fs * WINDOW_SECONDS
 
-# -------------------------------
-# Signal storage
-# -------------------------------
-green_signal = []  # raw green channel signal
-bpm_list = []      # rolling average for heart rate
+RR_WINDOW_SECONDS = 20
+RR_WINDOW_SIZE = fs * RR_WINDOW_SECONDS
 
-# -------------------------------
-# Main loop
-# -------------------------------
-while True:
+alpha_bpm = 0.2
+alpha_rr = 0.1
+
+# ===============================
+# SIGNAL PROCESSING FUNCTIONS
+# ===============================
+def bandpass(signal, fs, low=0.7, high=4.0):
+    nyq = 0.5 * fs
+    b, a = butter(3, [low / nyq, high / nyq], btype='band')
+    return filtfilt(b, a, signal)
+
+def calculate_bpm(signal, fs):
+    fft_vals = np.abs(fft(signal))
+    freqs = np.fft.fftfreq(len(fft_vals), 1/fs)
+
+    mask = (freqs > 0.7) & (freqs < 4.0)
+    peak_freq = freqs[mask][np.argmax(fft_vals[mask])]
+    return peak_freq * 60
+
+def calculate_respiration(signal, fs):
+    filtered = bandpass(signal, fs, low=0.1, high=0.5)
+    peaks, _ = find_peaks(filtered, distance=fs*2)
+    duration = len(signal) / fs
+    return (len(peaks) / duration) * 60
+
+# ===============================
+# MEDIAPIPE SETUP
+# ===============================
+mp_face = mp.solutions.face_mesh
+face_mesh = mp_face.FaceMesh(static_image_mode=False)
+
+FOREHEAD = [10, 338, 297, 332]
+CHEEKS = [50, 280]
+
+# ===============================
+# VARIABLES
+# ===============================
+green_signal = []
+smoothed_bpm = None
+smoothed_rr = None
+frame_count = 0
+
+# ===============================
+# VIDEO CAPTURE
+# ===============================
+cap = cv2.VideoCapture(0)
+
+print("[INFO] VitalSentry Started... Press 'q' to quit.")
+
+while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
         break
 
-    # Convert frame to RGB for MediaPipe
+    frame_count += 1
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    result = face_mesh.process(rgb)
+    results = face_mesh.process(rgb)
 
-    if result.multi_face_landmarks:
-        landmarks = result.multi_face_landmarks[0].landmark
+    if results.multi_face_landmarks:
+        landmarks = results.multi_face_landmarks[0].landmark
+        h, w, _ = frame.shape
 
-        # STEP 7: Extract Forehead ROI
-        forehead = extract_roi(frame, landmarks, FOREHEAD)
+        roi_pixels = []
 
-        if forehead.size > 0:
-            cv2.imshow("Forehead ROI", forehead)
+        for idx in FOREHEAD + CHEEKS:
+            x = int(landmarks[idx].x * w)
+            y = int(landmarks[idx].y * h)
+            roi_pixels.append(frame[y, x, 1])  # Green channel
 
-            # STEP 8: Extract green channel mean
-            green_mean = np.mean(forehead[:, :, 1])
-            green_signal.append(green_mean)
+        mean_green = np.mean(roi_pixels)
+        green_signal.append(mean_green)
 
-            # STEP 9: Filter signal if enough frames
-            if len(green_signal) >= 150:
-                filtered_signal = bandpass(green_signal, fs)
+        # ===============================
+        # HEART RATE CALCULATION
+        # ===============================
+        if len(green_signal) >= WINDOW_SIZE and frame_count % fs == 0:
+            window_signal = green_signal[-WINDOW_SIZE:]
+            filtered = bandpass(window_signal, fs)
+            bpm = calculate_bpm(filtered, fs)
 
-                # STEP 10: Heart Rate Calculation
-                bpm = calculate_bpm(filtered_signal, fs)
-                bpm_list.append(bpm)
-                if len(bpm_list) > 5:
-                    bpm_list.pop(0)
-                bpm_smooth = int(np.mean(bpm_list))
+            if smoothed_bpm is None:
+                smoothed_bpm = bpm
+            else:
+                smoothed_bpm = alpha_bpm * bpm + (1 - alpha_bpm) * smoothed_bpm
 
-                cv2.putText(frame, f"BPM: {bpm_smooth}",
-                            (30, 50), cv2.FONT_HERSHEY_SIMPLEX,
-                            1, (0, 255, 0), 2)
+        # ===============================
+        # RESPIRATION RATE CALCULATION
+        # ===============================
+        if len(green_signal) >= RR_WINDOW_SIZE and frame_count % (3 * fs) == 0:
+            rr_signal = green_signal[-RR_WINDOW_SIZE:]
+            rr = calculate_respiration(rr_signal, fs)
 
-            # STEP 11: Respiration Rate Calculation
-            if len(green_signal) >= 300:  # need ~10 sec of data
-                rr = calculate_respiration(green_signal, fs)
-                rr_smooth = int(rr)
-                cv2.putText(frame, f"RR: {rr_smooth} bpm",
-                            (30, 100), cv2.FONT_HERSHEY_SIMPLEX,
-                            1, (0, 255, 255), 2)
+            if smoothed_rr is None:
+                smoothed_rr = rr
+            else:
+                smoothed_rr = alpha_rr * rr + (1 - alpha_rr) * smoothed_rr
 
-    # Display main camera feed
-    cv2.imshow("VitalSentry", frame)
+        # ===============================
+        # DISPLAY
+        # ===============================
+        if smoothed_bpm:
+            cv2.putText(frame, f"Heart Rate: {int(smoothed_bpm)} BPM",
+                        (30, 50), cv2.FONT_HERSHEY_SIMPLEX,
+                        1, (0, 255, 0), 2)
 
-    # Exit on 'Esc'
-    if cv2.waitKey(1) & 0xFF == 27:
+        if smoothed_rr:
+            cv2.putText(frame, f"Respiration Rate: {int(smoothed_rr)} BPM",
+                        (30, 100), cv2.FONT_HERSHEY_SIMPLEX,
+                        1, (0, 255, 255), 2)
+
+    cv2.imshow("VitalSentry – Contactless Vitals Monitor", frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
-# -------------------------------
-# Release resources
-# -------------------------------
+# ===============================
+# CLEANUP
+# ===============================
 cap.release()
 cv2.destroyAllWindows()
